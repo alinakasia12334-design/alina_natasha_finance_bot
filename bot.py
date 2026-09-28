@@ -122,7 +122,8 @@ def clear(q):
 def clear_yes(q):
  if q.from_user.id not in ALLOWED_USERS:return
  a=q.data.replace('confirm_',''); c.execute('DELETE FROM expenses WHERE id>? AND '+("month=?" if a=='clear_month' else '1=1'),((cutoff(),month()) if a=='clear_month' else (cutoff(),)));c.commit();bot.answer_callback_query(q.id,'Готово');bot.send_message(q.message.chat.id,'💣 Незакрытая история очищена. Архив сохранён 🔒',reply_markup=menu())
-@bot.callback_query_handler(func=lambda q:q.data=='cancel_clear'): 
+@bot.callback_query_handler(func=lambda q:q.data=='cancel_clear')
+def cancel_clear(q):
  bot.answer_callback_query(q.id,'Фух 😮‍💨');bot.send_message(q.message.chat.id,'Ничего не удаляю 😌',reply_markup=menu())
 @bot.message_handler(func=lambda m:m.text=='🔎 Поиск')
 def search(m):
@@ -148,8 +149,11 @@ def flow(m):
  if s['step']=='type':
   if m.text.startswith('🤝') or m.text.startswith('🙋'):s.update(expense_type='shared' if m.text.startswith('🤝') else 'personal',step='note');return bot.send_message(m.chat.id,'Что это было? Можно коротко или «пропустить»')
   if m.text.startswith('💸'):
-   other=831511518 if s['payer_id']==463620997 else 463620997;s.update(expense_type='debt',debtor_id=other,debtor_name=PEOPLE[other],step='note');return bot.send_message(m.chat.id,f"Кто должен {s['payer_name']}? Это {PEOPLE[other]}. Напиши «да»")
+   other=831511518 if s['payer_id']==463620997 else 463620997;s.update(expense_type='debt',debtor_id=other,debtor_name=PEOPLE[other],step='debt_confirm');return bot.send_message(m.chat.id,f"Кто должен {s['payer_name']}? Это {PEOPLE[other]}. Напиши «да»")
   return bot.send_message(m.chat.id,'Выбери тип кнопкой 👆')
+ if s['step']=='debt_confirm':
+  if m.text.strip().lower() not in {'да','дa','yes'}:return bot.send_message(m.chat.id,'Подтверди кнопкой текстом «да» 👆')
+  s['step']='note';return bot.send_message(m.chat.id,'Что это было? Можно коротко или «пропустить»')
  if s['step']=='note':
   note='' if m.text.lower() in {'пропустить','-','нет'} else m.text;now=datetime.now().isoformat(timespec='seconds');c.execute('INSERT INTO expenses(month,payer_id,payer_name,amount,note,created_at,expense_type,debtor_id,debtor_name) VALUES(?,?,?,?,?,?,?,?,?)',(month(),s['payer_id'],s['payer_name'],s['amount'],note,now,s['expense_type'],s.get('debtor_id'),s.get('debtor_name')));c.commit();pending.pop(m.from_user.id,None);r=rows()[:1];k=types.InlineKeyboardMarkup();k.add(types.InlineKeyboardButton('↩️ Ой, отменить',callback_data=f'del:{r[0][0]}'));bot.send_message(m.chat.id,'✅ Записала!\n\n'+label(r[0])+'\n\n💰 '+bal(),reply_markup=k)
 class H(BaseHTTPRequestHandler):
