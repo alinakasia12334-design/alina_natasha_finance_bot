@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -14,7 +14,15 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 DB = os.getenv("DB_PATH", "expenses.db")
-ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip().isdigit()}
+
+# Only Alina and Natasha can use the bot.
+PEOPLE = {
+    463620997: "Алина",
+    831511518: "Наташа",
+}
+ALLOWED_USERS = set(PEOPLE) | {
+    int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip().isdigit()
+}
 
 conn = sqlite3.connect(DB, check_same_thread=False)
 conn.execute("""CREATE TABLE IF NOT EXISTS expenses (
@@ -23,24 +31,46 @@ conn.execute("""CREATE TABLE IF NOT EXISTS expenses (
     payer_id INTEGER NOT NULL,
     payer_name TEXT NOT NULL,
     amount REAL NOT NULL,
-    category TEXT NOT NULL,
-    note TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    category TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expense_type TEXT NOT NULL DEFAULT 'shared',
+    debtor_id INTEGER,
+    debtor_name TEXT
 )""")
+
+# Migrate an older database created by the first version of the bot.
+columns = {row[1] for row in conn.execute("PRAGMA table_info(expenses)").fetchall()}
+if "expense_type" not in columns:
+    conn.execute("ALTER TABLE expenses ADD COLUMN expense_type TEXT NOT NULL DEFAULT 'shared'")
+if "debtor_id" not in columns:
+    conn.execute("ALTER TABLE expenses ADD COLUMN debtor_id INTEGER")
+if "debtor_name" not in columns:
+    conn.execute("ALTER TABLE expenses ADD COLUMN debtor_name TEXT")
 conn.commit()
 
+DB_LOCK = threading.Lock()
 pending = {}
 
 
 def allowed(message):
-    return not ALLOWED_USERS or message.from_user.id in ALLOWED_USERS
+    return message.from_user.id in ALLOWED_USERS
 
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("➕ Добавить трату", "📊 Баланс")
-    kb.row("📋 История", "📈 Отчёт")
-    kb.row("🏠 Хата / коммуналка", "❓ Помощь")
+    kb.row("➕ Добавить трату", "💰 Баланс")
+    kb.row("📋 История", "📊 Отчёты")
+    kb.row("🔎 Поиск", "📈 Статистика")
+    kb.row("😂 Прикол", "❓ Помощь")
+    return kb
+
+
+def report_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row("📅 Сегодня", "📆 Неделя")
+    kb.row("🗓 Месяц", "📅 Выбрать месяц")
+    kb.row("◀️ Назад")
     return kb
 
 
@@ -52,106 +82,373 @@ def money(v):
     return f"{v:,.0f} ₽".replace(",", " ")
 
 
+def person_name(user_id):
+    return PEOPLE.get(user_id, "Пользователь")
+
+
+def parse_amount(text):
+    try:
+        value = Decimal(text.replace(" ", "").replace(",", "."))
+        if value <= 0:
+            raise ValueError
+        return float(value)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def all_rows(where="", params=()):
+    with DB_LOCK:
+        return conn.execute(
+            "SELECT id, payer_id, payer_name, amount, expense_type, debtor_id, debtor_name, note, created_at "
+            "FROM expenses " + where + " ORDER BY created_at DESC, id DESC",
+            params,
+        ).fetchall()
+
+
+def insert_expense(state, user_id):
+    payer_name = person_name(state["payer_id"])
+    debtor_id = state.get("debtor_id")
+    debtor_name = person_name(debtor_id) if debtor_id else None
+    created_at = datetime.now().isoformat(timespec="seconds")
+    month = created_at[:7]
+    with DB_LOCK:
+        conn.execute(
+            "INSERT INTO expenses(month,payer_id,payer_name,amount,category,note,created_at,expense_type,debtor_id,debtor_name) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                month,
+                state["payer_id"],
+                payer_name,
+                state["amount"],
+                "",
+                state["note"],
+                created_at,
+                state["expense_type"],
+                debtor_id,
+                debtor_name,
+            ),
+        )
+        conn.commit()
+
+
+def expense_label(row):
+    _, payer_id, payer_name, amount, expense_type, debtor_id, debtor_name, note, created_at = row
+    dt = datetime.fromisoformat(created_at).strftime("%d.%m %H:%M")
+    if expense_type == "shared":
+        kind = "🤝 50/50"
+    elif expense_type == "personal":
+        kind = "🙋 Личная"
+    else:
+        kind = f"💸 Долг: {debtor_name} → {payer_name}"
+    return f"{dt} · {payer_name} · {money(amount)} · {kind}\n   {note}"
+
+
 @bot.message_handler(commands=["start"])
 def start(message):
     if not allowed(message):
         bot.reply_to(message, "⛔ Этот бот только для Алины и Наташи 💅")
         return
-    bot.send_message(message.chat.id, "💅 Привет! Это ваш общий кошелёк Алина × Наташа 💸\n\nДобавляйте траты — я сам посчитаю, кто сколько внёс и кто кому должен.", reply_markup=menu())
+    bot.send_message(
+        message.chat.id,
+        "💅 Привет! Это финансовый бот Алина × Наташа.\n\n"
+        "Я буду помнить каждую трату, кто заплатил, что делим 50/50, а что является долгом.\n\n"
+        "Никаких странных категорий вроде «хата/коммуналка» — только смысл траты.",
+        reply_markup=menu(),
+    )
+
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+    if allowed(message):
+        bot.send_message(message.chat.id, help_text(), reply_markup=menu())
+
+
+def help_text():
+    return (
+        "🧠 Как пользоваться:\n\n"
+        "➕ Добавить трату → сумма → кто заплатил → тип траты → комментарий.\n\n"
+        "🤝 50/50 — расход считается общим и делится поровну.\n"
+        "🙋 Личная — просто записывается в историю и не меняет взаимный баланс.\n"
+        "💸 Долг/заём — вся сумма записывается как долг того, кто должен, тому, кто заплатил.\n\n"
+        "💰 Баланс — кто кому сколько должен.\n"
+        "📊 Отчёты — день / неделя / месяц.\n"
+        "🔎 Поиск — ищет по описанию и участнику.\n"
+        "📈 Статистика — суммы, количество трат и самые дорогие покупки.\n"
+        "😂 Прикол — иногда финансовая аналитика с характером."
+    )
 
 
 @bot.message_handler(func=lambda m: m.text == "❓ Помощь")
 def help_msg(message):
     if allowed(message):
-        bot.send_message(message.chat.id, "💸 Добавляй каждую общую трату.\n\n➕ Кто заплатил → сумма → категория → комментарий.\n📊 Баланс покажет, кто кому должен.\n📈 Отчёт покажет расходы за месяц.\n🏠 Хата и коммуналка можно вести отдельной категорией.", reply_markup=menu())
+        bot.send_message(message.chat.id, help_text(), reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить трату")
 def add_start(message):
-    if not allowed(message): return
+    if not allowed(message):
+        return
     pending[message.from_user.id] = {"step": "amount"}
-    bot.send_message(message.chat.id, "💸 Сколько потратила?\nНапиши сумму, например: 3500")
+    bot.send_message(message.chat.id, "💸 Сколько потратили?\nНапиши сумму, например: 3500")
 
 
-@bot.message_handler(func=lambda m: m.text == "📊 Баланс")
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
 def balance(message):
-    if not allowed(message): return
-    rows = conn.execute("SELECT payer_id, payer_name, SUM(amount) FROM expenses WHERE month=? GROUP BY payer_id, payer_name", (current_month(),)).fetchall()
-    if not rows:
-        bot.send_message(message.chat.id, "Пока за этот месяц трат нет 🥹", reply_markup=menu()); return
-    total = sum(r[2] for r in rows)
-    lines = [f"💅 Баланс за {current_month()[5:]}.{current_month()[:4]}", f"Общие расходы: {money(total)}", ""]
-    for _, name, amount in rows:
-        lines.append(f"• {name}: {money(amount)}")
-    lines.append(f"\nЕсли делим общие расходы 50/50: {money(total/2)} с каждой.")
-    by_name = {r[1]: r[2] for r in rows}
-    if len(by_name) == 2:
-        a, b = list(by_name.items())
-        diff = (a[1] - b[1]) / 2
-        if abs(diff) < 0.01:
-            lines.append("✨ Всё ровно, никто никому не должен!")
-        elif diff > 0:
-            lines.append(f"💸 {b[0]} должна {a[0]}: {money(diff)}")
-        else:
-            lines.append(f"💸 {a[0]} должна {b[0]}: {money(-diff)}")
+    if not allowed(message):
+        return
+
+    rows = all_rows()
+    # Net settlement consists of shared expenses plus explicit debts.
+    net = {463620997: 0.0, 831511518: 0.0}
+    for row in rows:
+        _, payer_id, _, amount, expense_type, debtor_id, _, _, _ = row
+        if expense_type == "shared":
+            net[payer_id] += amount / 2
+            other = 831511518 if payer_id == 463620997 else 463620997
+            net[other] -= amount / 2
+        elif expense_type == "debt" and debtor_id in net:
+            net[debtor_id] += amount
+            net[payer_id] -= amount
+
+    lines = ["💰 БАЛАНС", "", f"Алина: {money(abs(net[463620997]))}", f"Наташа: {money(abs(net[831511518]))}", ""]
+    if abs(net[463620997]) < 0.01:
+        lines.append("✨ Всё ровно. Никто никому не должен!")
+    elif net[463620997] > 0:
+        lines.append(f"💸 Наташа должна Алине: {money(net[463620997])}")
+    else:
+        lines.append(f"💸 Алина должна Наташе: {money(-net[463620997])}")
+
+    # Explicit debt reminder.
+    debts = [r for r in rows if r[4] == "debt"]
+    if debts:
+        lines.append("\n📌 Долги/займы:")
+        for r in debts[:10]:
+            lines.append(f"• {r[7]} — {money(r[3])}: {r[6]} → {r[2]}")
+
     bot.send_message(message.chat.id, "\n".join(lines), reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "📋 История")
 def history(message):
-    if not allowed(message): return
-    rows = conn.execute("SELECT payer_name, amount, category, note FROM expenses WHERE month=? ORDER BY id DESC LIMIT 30", (current_month(),)).fetchall()
+    if not allowed(message):
+        return
+    rows = all_rows("WHERE month=?", (current_month(),))[:30]
     if not rows:
-        bot.send_message(message.chat.id, "Пока пусто 🫠", reply_markup=menu()); return
-    text = "📋 Траты за текущий месяц:\n\n"
-    for name, amount, cat, note in rows:
-        text += f"• {name} — {money(amount)} — {cat}\n  {note}\n"
+        bot.send_message(message.chat.id, "Пока за этот месяц пусто 🫠", reply_markup=menu())
+        return
+    text = "📋 ИСТОРИЯ — текущий месяц\n\n" + "\n\n".join(expense_label(r) for r in rows)
+    bot.send_message(message.chat.id, text[:3900], reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Отчёты")
+def reports_start(message):
+    if allowed(message):
+        bot.send_message(message.chat.id, "Какой отчёт показать?", reply_markup=report_menu())
+
+
+@bot.message_handler(func=lambda m: m.text in {"📅 Сегодня", "📆 Неделя", "🗓 Месяц"})
+def report_period(message):
+    if not allowed(message):
+        return
+    now = datetime.now()
+    if message.text == "📅 Сегодня":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        title = f"СЕГОДНЯ — {now:%d.%m.%Y}"
+    elif message.text == "📆 Неделя":
+        start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        title = f"НЕДЕЛЯ — {start:%d.%m}–{now:%d.%m}"
+    else:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        title = f"МЕСЯЦ — {now:%m.%Y}"
+
+    rows = all_rows("WHERE created_at >= ?", (start.isoformat(timespec="seconds"),))
+    send_report(message.chat.id, title, rows)
+
+
+@bot.message_handler(func=lambda m: m.text == "📅 Выбрать месяц")
+def choose_month(message):
+    if not allowed(message):
+        return
+    pending[message.from_user.id] = {"step": "month"}
+    bot.send_message(message.chat.id, "Напиши месяц в формате ММ.ГГГГ, например 09.2026")
+
+
+@bot.message_handler(func=lambda m: m.text == "◀️ Назад")
+def back(message):
+    if allowed(message):
+        pending.pop(message.from_user.id, None)
+        bot.send_message(message.chat.id, "Ок 💅", reply_markup=menu())
+
+
+def send_report(chat_id, title, rows):
+    if not rows:
+        bot.send_message(chat_id, f"📊 {title}\n\nПока трат нет 🥹", reply_markup=menu())
+        return
+    total_all = sum(r[3] for r in rows)
+    shared = sum(r[3] for r in rows if r[4] == "shared")
+    personal = sum(r[3] for r in rows if r[4] == "personal")
+    debts = sum(r[3] for r in rows if r[4] == "debt")
+    by_payer = {}
+    for r in rows:
+        by_payer[r[2]] = by_payer.get(r[2], 0) + r[3]
+    text = (
+        f"📊 {title}\n\n"
+        f"💸 Всего записано: {money(total_all)}\n"
+        f"🤝 Общих 50/50: {money(shared)}\n"
+        f"🙋 Личных: {money(personal)}\n"
+        f"💸 Долгов/займов: {money(debts)}\n\n"
+        + "\n".join(f"👛 {name}: {money(amount)}" for name, amount in by_payer.items())
+    )
+    bot.send_message(chat_id, text, reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "🔎 Поиск")
+def search_start(message):
+    if not allowed(message):
+        return
+    pending[message.from_user.id] = {"step": "search"}
+    bot.send_message(message.chat.id, "🔎 Что ищем? Например: такси, продукты, Алина, долг, 5000")
+
+
+@bot.message_handler(func=lambda m: m.text == "📈 Статистика")
+def statistics(message):
+    if not allowed(message):
+        return
+    rows = all_rows("WHERE month=?", (current_month(),))
+    if not rows:
+        bot.send_message(message.chat.id, "📈 Статистика пока пустая 🥲", reply_markup=menu())
+        return
+    total = sum(r[3] for r in rows)
+    avg = total / len(rows)
+    biggest = max(rows, key=lambda r: r[3])
+    shared_count = sum(1 for r in rows if r[4] == "shared")
+    debt_count = sum(1 for r in rows if r[4] == "debt")
+    text = (
+        f"📈 СТАТИСТИКА — {datetime.now():%m.%Y}\n\n"
+        f"💸 Трат: {len(rows)}\n"
+        f"💰 Сумма: {money(total)}\n"
+        f"🧾 Средняя трата: {money(avg)}\n"
+        f"🤝 Общих: {shared_count}\n"
+        f"💸 Долгов/займов: {debt_count}\n\n"
+        f"🏆 Самая дорогая: {money(biggest[3])} — {biggest[7]}"
+    )
     bot.send_message(message.chat.id, text, reply_markup=menu())
 
 
-@bot.message_handler(func=lambda m: m.text == "📈 Отчёт")
-def report(message):
-    if not allowed(message): return
-    rows = conn.execute("SELECT payer_name, SUM(amount) FROM expenses WHERE month=? GROUP BY payer_name", (current_month(),)).fetchall()
-    total = sum(x[1] for x in rows)
-    text = f"📊 ОТЧЁТ — {current_month()[5:]}.{current_month()[:4]}\n\n💸 Всего: {money(total)}\n"
-    for name, amount in rows:
-        text += f"👛 {name}: {money(amount)}\n"
-    bot.send_message(message.chat.id, text, reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🏠 Хата / коммуналка")
-def home_report(message):
-    if not allowed(message): return
-    rows = conn.execute("SELECT payer_name, SUM(amount) FROM expenses WHERE month=? AND category IN ('Хата','Коммуналка') GROUP BY payer_name", (current_month(),)).fetchall()
-    total = sum(x[1] for x in rows)
-    text = f"🏠 ХАТА + КОММУНАЛКА\nВсего: {money(total)}\n\n" + "\n".join(f"• {n}: {money(a)}" for n,a in rows)
-    bot.send_message(message.chat.id, text, reply_markup=menu())
+@bot.message_handler(func=lambda m: m.text == "😂 Прикол")
+def joke(message):
+    if not allowed(message):
+        return
+    rows = all_rows("WHERE month=?", (current_month(),))
+    total = sum(r[3] for r in rows)
+    jokes = [
+        f"😂 За этот месяц вы уже потратили {money(total)}. Деньги просто решили пожить у других людей.",
+        "😂 Финансовое правило №1: если не смотреть баланс, кажется, что всё нормально.",
+        "😂 Я не осуждаю ваши траты. Я их документирую. Это хуже.",
+        "😂 Долг — это когда деньги ушли в отпуск, но обещали вернуться.",
+        "😂 50/50 — потому что 100/0 почему-то никто не согласовывает.",
+    ]
+    import random
+    bot.send_message(message.chat.id, random.choice(jokes), reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: True)
 def flow(message):
-    if not allowed(message): return
-    state = pending.get(message.from_user.id)
-    if not state: return
+    if not allowed(message):
+        return
     uid = message.from_user.id
-    if state["step"] == "amount":
-        try: amount = float(Decimal(message.text.replace(" ", "").replace(",", ".")))
-        except (InvalidOperation, ValueError):
-            bot.send_message(message.chat.id, "Напиши сумму цифрами, например 2500"); return
-        state.update(amount=amount, step="category")
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-        for x in ["Общак", "Хата", "Коммуналка", "Продукты", "Развлечения", "Другое"]: kb.add(types.KeyboardButton(x))
-        bot.send_message(message.chat.id, "Куда отнести трату? 💅", reply_markup=kb)
-    elif state["step"] == "category":
-        state.update(category=message.text, step="note")
-        bot.send_message(message.chat.id, "Что купили/за что заплатили? Напиши коротко 📝")
-    elif state["step"] == "note":
-        name = message.from_user.first_name or "Пользователь"
-        conn.execute("INSERT INTO expenses(month,payer_id,payer_name,amount,category,note,created_at) VALUES(?,?,?,?,?,?,?)", (current_month(), uid, name, state["amount"], state["category"], message.text, datetime.now().isoformat(timespec="seconds")))
-        conn.commit()
+    state = pending.get(uid)
+    if not state:
+        return
+
+    if state["step"] == "month":
+        try:
+            dt = datetime.strptime(message.text.strip(), "%m.%Y")
+        except ValueError:
+            bot.send_message(message.chat.id, "Нужно так: 09.2026")
+            return
+        month = dt.strftime("%Y-%m")
+        rows = all_rows("WHERE month=?", (month,))
         pending.pop(uid, None)
-        bot.send_message(message.chat.id, f"Записала 💅\n{money(state['amount'])} · {state['category']}\n{message.text}\n\nТеперь можно посмотреть 📊 Баланс.", reply_markup=menu())
+        send_report(message.chat.id, f"МЕСЯЦ — {dt:%m.%Y}", rows)
+        return
+
+    if state["step"] == "search":
+        query = message.text.strip().lower()
+        pending.pop(uid, None)
+        rows = all_rows()
+        found = []
+        for row in rows:
+            haystack = " ".join(str(x or "") for x in row).lower()
+            if query in haystack:
+                found.append(row)
+        if not found:
+            bot.send_message(message.chat.id, "🔎 Ничего не нашла. Даже подозрительно 🕵️", reply_markup=menu())
+            return
+        text = "🔎 РЕЗУЛЬТАТЫ\n\n" + "\n\n".join(expense_label(r) for r in found[:30])
+        bot.send_message(message.chat.id, text[:3900], reply_markup=menu())
+        return
+
+    if state["step"] == "amount":
+        amount = parse_amount(message.text)
+        if amount is None:
+            bot.send_message(message.chat.id, "Напиши сумму цифрами, например 2500")
+            return
+        state.update(amount=amount, step="payer")
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        kb.row("👩🏻 Алина", "👩🏼 Наташа")
+        bot.send_message(message.chat.id, "Кто заплатил?", reply_markup=kb)
+        return
+
+    if state["step"] == "payer":
+        payer_map = {"👩🏻 Алина": 463620997, "👩🏼 Наташа": 831511518}
+        payer_id = payer_map.get(message.text)
+        if not payer_id:
+            bot.send_message(message.chat.id, "Выбери Алину или Наташу кнопкой 👆")
+            return
+        state.update(payer_id=payer_id, step="type")
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+        kb.row("🤝 Делим 50/50", "🙋 Личная")
+        kb.row("💸 Долг / заём")
+        bot.send_message(message.chat.id, "Как учитывать эту трату?", reply_markup=kb)
+        return
+
+    if state["step"] == "type":
+        type_map = {
+            "🤝 Делим 50/50": "shared",
+            "🙋 Личная": "personal",
+            "💸 Долг / заём": "debt",
+        }
+        expense_type = type_map.get(message.text)
+        if not expense_type:
+            bot.send_message(message.chat.id, "Выбери один из вариантов кнопкой 👆")
+            return
+        state["expense_type"] = expense_type
+        if expense_type == "debt":
+            debtor_id = 831511518 if state["payer_id"] == 463620997 else 463620997
+            state.update(debtor_id=debtor_id, step="note")
+            debtor = person_name(debtor_id)
+            bot.send_message(
+                message.chat.id,
+                f"💸 Записываю долг на {debtor}.\nКоротко напиши, за что/зачем был заём:",
+            )
+        else:
+            state["step"] = "note"
+            bot.send_message(message.chat.id, "Что это было? Напиши коротко 📝")
+        return
+
+    if state["step"] == "note":
+        state["note"] = message.text.strip()
+        insert_expense(state, uid)
+        amount = state["amount"]
+        payer = person_name(state["payer_id"])
+        kind = {"shared": "🤝 делим 50/50", "personal": "🙋 личная", "debt": f"💸 долг {person_name(state['debtor_id'])}"}[state["expense_type"]]
+        pending.pop(uid, None)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Записала!\n\n{money(amount)} · {payer}\n{kind}\n📝 {state['note']}\n\nМожешь открыть 💰 Баланс или 📊 Отчёты.",
+            reply_markup=menu(),
+        )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
