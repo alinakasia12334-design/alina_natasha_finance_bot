@@ -1,7 +1,9 @@
 import os
 import sqlite3
+import threading
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import telebot
 from telebot import types
@@ -152,6 +154,25 @@ def flow(message):
         bot.send_message(message.chat.id, f"Записала 💅\n{money(state['amount'])} · {state['category']}\n{message.text}\n\nТеперь можно посмотреть 📊 Баланс.", reply_markup=menu())
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Alina x Natasha finance bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_web_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on port {port}")
+    server.serve_forever()
+
+
 if __name__ == "__main__":
     bot.delete_webhook(drop_pending_updates=True)
-    bot.infinity_polling(skip_pending=True)
+    threading.Thread(target=bot.infinity_polling, kwargs={"skip_pending": True}, daemon=True).start()
+    run_web_server()
