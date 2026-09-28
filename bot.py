@@ -1,4 +1,4 @@
-import os,sqlite3,threading
+import os,sqlite3,threading,time
 from datetime import datetime,timedelta
 from decimal import Decimal,InvalidOperation
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
@@ -152,7 +152,7 @@ def flow(m):
    other=831511518 if s['payer_id']==463620997 else 463620997;s.update(expense_type='debt',debtor_id=other,debtor_name=PEOPLE[other],step='debt_confirm');return bot.send_message(m.chat.id,f"Кто должен {s['payer_name']}? Это {PEOPLE[other]}. Напиши «да»")
   return bot.send_message(m.chat.id,'Выбери тип кнопкой 👆')
  if s['step']=='debt_confirm':
-  if m.text.strip().lower() not in {'да','дa','yes'}:return bot.send_message(m.chat.id,'Подтверди кнопкой текстом «да» 👆')
+  if m.text.strip().lower() not in {'да','дa','yes'}:return bot.send_message(m.chat.id,'Подтверди текстом «да» 👆')
   s['step']='note';return bot.send_message(m.chat.id,'Что это было? Можно коротко или «пропустить»')
  if s['step']=='note':
   note='' if m.text.lower() in {'пропустить','-','нет'} else m.text;now=datetime.now().isoformat(timespec='seconds');c.execute('INSERT INTO expenses(month,payer_id,payer_name,amount,note,created_at,expense_type,debtor_id,debtor_name) VALUES(?,?,?,?,?,?,?,?,?)',(month(),s['payer_id'],s['payer_name'],s['amount'],note,now,s['expense_type'],s.get('debtor_id'),s.get('debtor_name')));c.commit();pending.pop(m.from_user.id,None);r=rows()[:1];k=types.InlineKeyboardMarkup();k.add(types.InlineKeyboardButton('↩️ Ой, отменить',callback_data=f'del:{r[0][0]}'));bot.send_message(m.chat.id,'✅ Записала!\n\n'+label(r[0])+'\n\n💰 '+bal(),reply_markup=k)
@@ -160,4 +160,10 @@ class H(BaseHTTPRequestHandler):
  def do_GET(self):self.send_response(200);self.end_headers();self.wfile.write(b'OK')
  def log_message(self,*a):pass
 def serve():ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','10000'))),H).serve_forever()
-if __name__=='__main__':threading.Thread(target=serve,daemon=True).start();bot.infinity_polling(skip_pending=True)
+if __name__=='__main__':
+ threading.Thread(target=serve,daemon=True).start()
+ while True:
+  try: bot.infinity_polling(skip_pending=True)
+  except Exception as e:
+   print(f'Polling error, retrying: {e}',flush=True)
+   time.sleep(5)
